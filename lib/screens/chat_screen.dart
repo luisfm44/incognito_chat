@@ -1,10 +1,10 @@
-import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:uuid/uuid.dart';
 import 'dart:io';
-import 'package:web_socket_channel/io.dart';
-
+import 'package:flutter/material.dart';
+import 'package:qr_flutter/qr_flutter.dart';
+import 'package:share_plus/share_plus.dart';
 import '../models/chat_message.dart';
+import '../services/api_client.dart';
+import '../services/auth_service.dart';
 import '../services/socket_service.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -16,72 +16,129 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   final _messageController = TextEditingController();
-  final _receiverIdController = TextEditingController();
-  final _uuid = const Uuid();
-  late final String myId;
-  late final SocketService socketService;
+  final _inviteTokenController = TextEditingController();
 
+  late final ApiClient api;
+  AuthService? auth;
+  SocketService? socket;
+
+  String? userId;
+  String? authToken;
+  String? conversationId;
   final List<ChatMessage> messages = [];
 
   @override
   void initState() {
     super.initState();
-    myId = _uuid.v4();
+    // Ajusta el host según tu server (10.0.2.2 para emulador Android)
+    final base = Platform.isAndroid ? 'https://10.0.2.2:5223' : 'https://localhost:5223';
+    api = ApiClient(base);
+    auth = AuthService(api);
+    _bootstrap();
+  }
 
-    final socket = IOWebSocketChannel.connect(
-      Uri.parse('wss://10.0.2.2:5223/chat'),
-    );
+  Future<void> _bootstrap() async {
+    try {
+      final (uid, token) = await auth!.ensureIdentityAndToken();
+      setState(() {
+        userId = uid;
+        authToken = token;
+      });
+      _openSocket();
+    } catch (e) {
+      _snack('Error de registro: $e');
+    }
+  }
 
-
-    socketService = SocketService(
-      myId: myId,
-      channel: socket,
-      onMessageReceived: (ChatMessage message) {
-        setState(() {
-          messages.add(message);
-        });
+  void _openSocket() {
+    final wsUrl = '${api.baseUrl}/chat';
+    socket = SocketService(
+      userId: userId!,
+      wsBase: wsUrl,
+      authToken: authToken!,
+      onMessage: (msg) {
+        setState(() => messages.add(msg));
       },
-      onConnectionClosed: () {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('🔌 Conexión cerrada con el servidor')),
-            );
-          }
-        });
+      onAck: (id) {
+        // opcional: marcar entregado
       },
-      onConnectionError: (error) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('⚠️ Error de conexión: $error')),
-            );
-          }
-        });
-      },
-    );
+      onError: (err) => _snack('WS error: $err'),
+      onClosed: () => _snack('Conexión cerrada, reintentando…'),
+    )..connect();
   }
 
   @override
   void dispose() {
-    socketService.dispose();
+    socket?.dispose();
     _messageController.dispose();
-    _receiverIdController.dispose();
+    _inviteTokenController.dispose();
     super.dispose();
+  }
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<void> _createConversation() async {
+    try {
+      final (cid, invite) = await api.createConversation();
+      setState(() => conversationId = cid);
+      final deepLink = 'incognitochat://invite?token=$invite';
+      if (!mounted) return;
+      showModalBottomSheet(
+        context: context,
+        showDragHandle: true,
+        builder: (_) => Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('Invita a tu contacto', style: TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 12),
+              QrImageView(data: deepLink, size: 180),
+              const SizedBox(height: 12),
+              SelectableText(deepLink, style: const TextStyle(fontSize: 12)),
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                onPressed: () => Share.share(deepLink),
+                icon: const Icon(Icons.share),
+                label: const Text('Compartir enlace'),
+              ),
+            ],
+          ),
+        ),
+      );
+    } catch (e) {
+      _snack('No se pudo crear la conversación: $e');
+    }
+  }
+
+  Future<void> _acceptInvite() async {
+    final token = _inviteTokenController.text.trim();
+    if (token.isEmpty) return;
+    try {
+      final cid = await api.acceptInvitation(token);
+      setState(() => conversationId = cid);
+      _snack('¡Te uniste a la conversación!');
+    } catch (e) {
+      _snack('Invitación inválida: $e');
+    }
   }
 
   void _sendMessage() {
     final text = _messageController.text.trim();
-    final receiverId = _receiverIdController.text.trim();
-    if (text.isEmpty || receiverId.isEmpty) return;
-    socketService.sendMessage(to: receiverId, content: text);
+    if (text.isEmpty || conversationId == null) return;
+    final msg = ChatMessage(
+      messageId: DateTime.now().microsecondsSinceEpoch.toString(),
+      conversationId: conversationId!,
+      fromUserId: userId!,
+      content: text,
+      timestampClient: DateTime.now(),
+    );
+    socket?.sendMessage(msg);
     setState(() {
-      messages.add(ChatMessage(
-        from: myId,
-        to: receiverId,
-        content: text,
-        timestamp: DateTime.now(),
-      ));
+      messages.add(msg);
       _messageController.clear();
     });
   }
@@ -89,111 +146,125 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.grey[100],
       appBar: AppBar(
-        title: const Text('Incognito Chat'),
-        backgroundColor: Colors.indigo,
+        title: const Text('Incognito Chat (v2)'),
+        actions: [
+          IconButton(
+            tooltip: 'Nueva conversación',
+            onPressed: _createConversation,
+            icon: const Icon(Icons.add_comment_rounded),
+          ),
+        ],
       ),
       body: Column(
         children: [
-          Container(
-            color: Colors.indigo[50],
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        'Mi UUID: $myId',
-                        style: const TextStyle(fontSize: 12, color: Colors.black54),
+          if (userId != null)
+            Container(
+              color: Colors.indigo.withOpacity(0.05),
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text('Mi userId: $userId', style: const TextStyle(fontSize: 12)),
                       ),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.copy, size: 18),
-                      tooltip: 'Copiar UUID',
-                      onPressed: () {
-                        Clipboard.setData(ClipboardData(text: myId));
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('📋 UUID copiado al portapapeles')),
-                        );
-                      },
-                    )
-                  ],
-                ),
-                const SizedBox(height: 6),
-                TextField(
-                  controller: _receiverIdController,
-                  decoration: InputDecoration(
-                    labelText: 'UUID del receptor',
-                    filled: true,
-                    fillColor: Colors.white,
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                      if (conversationId != null)
+                        Text('Conv: $conversationId', style: const TextStyle(fontSize: 12)),
+                    ],
                   ),
-                ),
-              ],
-            ),
-          ),
-          Expanded(
-            child: Container(
-              color: Colors.white,
-              child: ListView.builder(
-                itemCount: messages.length,
-                itemBuilder: (context, index) {
-                  final msg = messages[index];
-                  final isMe = msg.from == myId;
-                  return Align(
-                    alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
-                    child: Container(
-                      padding: const EdgeInsets.all(12),
-                      margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 10),
-                      decoration: BoxDecoration(
-                        color: isMe ? Colors.indigo[100] : Colors.grey[300],
-                        borderRadius: BorderRadius.only(
-                          topLeft: const Radius.circular(16),
-                          topRight: const Radius.circular(16),
-                          bottomLeft: Radius.circular(isMe ? 16 : 0),
-                          bottomRight: Radius.circular(isMe ? 0 : 16),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _inviteTokenController,
+                          decoration: const InputDecoration(
+                            labelText: 'Pegar token de invitación',
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                          ),
                         ),
                       ),
-                      child: Text(
-                        msg.content,
-                        style: const TextStyle(fontSize: 16),
+                      const SizedBox(width: 8),
+                      FilledButton(
+                        onPressed: _acceptInvite,
+                        child: const Text('Unirme'),
                       ),
-                    ),
-                  );
-                },
+                    ],
+                  ),
+                ],
               ),
             ),
-          ),
-          Container(
-            padding: const EdgeInsets.all(8.0),
-            color: Colors.white,
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _messageController,
-                    decoration: InputDecoration(
-                      hintText: 'Escribe un mensaje...',
-                      filled: true,
-                      fillColor: Colors.grey[200],
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(10),
-                        borderSide: BorderSide.none,
+          Expanded(
+            child: ListView.builder(
+              padding: const EdgeInsets.only(top: 8),
+              itemCount: messages.length,
+              itemBuilder: (context, index) {
+                final m = messages[index];
+                final isMe = m.fromUserId == userId;
+                return Align(
+                  alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+                  child: Container(
+                    margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: isMe ? Colors.indigo[100] : Colors.grey[300],
+                      borderRadius: BorderRadius.only(
+                        topLeft: const Radius.circular(16),
+                        topRight: const Radius.circular(16),
+                        bottomLeft: Radius.circular(isMe ? 16 : 0),
+                        bottomRight: Radius.circular(isMe ? 0 : 16),
                       ),
                     ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(m.content),
+                        const SizedBox(height: 4),
+                        Text(
+                          m.timestampServer?.toLocal().toString() ?? m.timestampClient.toLocal().toString(),
+                          style: const TextStyle(fontSize: 10, color: Colors.black54),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-                const SizedBox(width: 8),
-                FloatingActionButton(
-                  onPressed: _sendMessage,
-                  backgroundColor: Colors.indigo,
-                  mini: true,
-                  child: const Icon(Icons.send, color: Colors.white),
-                )
-              ],
+                );
+              },
+            ),
+          ),
+          SafeArea(
+            top: false,
+            child: Container(
+              padding: const EdgeInsets.all(8),
+              color: Colors.white,
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _messageController,
+                      decoration: InputDecoration(
+                        hintText: conversationId == null
+                            ? 'Crea o únete a una conversación…'
+                            : 'Escribe un mensaje…',
+                        filled: true,
+                        fillColor: Colors.grey[200],
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                      enabled: conversationId != null,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  FloatingActionButton.small(
+                    onPressed: conversationId != null ? _sendMessage : null,
+                    child: const Icon(Icons.send),
+                  ),
+                ],
+              ),
             ),
           ),
         ],
