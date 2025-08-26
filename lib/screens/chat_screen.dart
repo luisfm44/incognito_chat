@@ -51,7 +51,8 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _openSocket() {
-    final wsUrl = '${api.baseUrl}/chat';
+    final wsUrl = '${api.baseUrl.replaceFirst(RegExp(r'^https://'), 'wss://')}/chat';
+
     socket = SocketService(
       userId: userId!,
       wsBase: wsUrl,
