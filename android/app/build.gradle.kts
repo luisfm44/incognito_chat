@@ -4,19 +4,26 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+/** Evitar clases duplicadas de androidx.activity forzando UNA versión */
+configurations.all {
+    resolutionStrategy.eachDependency {
+        if (requested.group == "androidx.activity") {
+            useVersion("1.9.2")
+            because("evitar duplicados de androidx.activity(.ktx).R")
+        }
+    }
+}
+
 android {
     namespace = "com.example.incognito_chat"
-    compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+    compileSdk = 36
+    ndkVersion = "27.0.12077973"
 
-    // ✅ Usa Java 17 para alinear con la toolchain
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
-    }
+    kotlinOptions { jvmTarget = "17" }
 
     defaultConfig {
         applicationId = "com.example.incognito_chat"
@@ -24,10 +31,7 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-
-        // ✅ Define el placeholder para que el IDE no marque error
         manifestPlaceholders["applicationName"] = "io.flutter.app.FlutterApplication"
-        // Si más adelante creas tu propia clase Application, cambia el valor por el FQCN de tu clase.
     }
 
     buildTypes {
@@ -35,8 +39,14 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
+    buildFeatures {
+        viewBinding = true
+    }
+    dependenciesInfo {
+        includeInApk = true
+        includeInBundle = true
+    }
+    buildToolsVersion = "36.0.0"
 }
 
-flutter {
-    source = "../.."
-}
+flutter { source = "../.." }

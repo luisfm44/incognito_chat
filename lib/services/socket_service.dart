@@ -1,10 +1,10 @@
 // lib/services/socket_service.dart
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show HttpClient, HttpOverrides, SecurityContext, X509Certificate; // IO only
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'dart:io' show HttpClient, X509Certificate; // IO only
+import 'package:flutter/foundation.dart' show kIsWeb, kDebugMode;
 import 'package:web_socket_channel/web_socket_channel.dart';
-import 'package:web_socket_channel/io.dart'; // IO: headers y mejor control
+import 'package:web_socket_channel/io.dart';
 
 import '../models/ws_envelope.dart';
 import '../models/chat_message.dart';
@@ -15,7 +15,7 @@ enum SocketStatus { connecting, open, closed }
 
 class SocketService {
   final String userId;
-  /// Ej: wss://10.0.2.2:5223/chat   (IMPORTANTE: esquema wss://)
+  /// Ej: wss://10.0.2.2:5223/chat
   final String wsBase;
   /// JWT o similar
   final String authToken;
@@ -42,41 +42,14 @@ class SocketService {
     this.onClosed,
   });
 
-  /// En Web no podemos mandar headers arbitrarios; usamos query param.
-  Uri _uriForWeb() {
-    final uri = Uri.parse(wsBase);
-    return uri.replace(queryParameters: {
-      ...uri.queryParameters,
-      'auth': authToken, // Servidor debe aceptar este modo en Web.
-    });
-  }
-
-  /// Conecta (no hace nada si ya está abriendo/abierta)
+  /// Conecta el WebSocket si no está abierto.
   void connect() {
-    if (status == SocketStatus.connecting || status == SocketStatus.open) return;
-
+    if (_isConnectingOrOpen()) return;
     _manuallyClosed = false;
     status = SocketStatus.connecting;
 
     try {
-      if (kIsWeb) {
-        // Web: sin headers -> query param
-        final uri = _uriForWeb();
-        _channel = WebSocketChannel.connect(uri);
-      } else {
-        // IO: headers Authorization y permitir cert dev para hosts conocidos
-        _installDevHttpOverrides();
-        final uri = Uri.parse(wsBase);
-        _channel = IOWebSocketChannel.connect(
-          uri,
-          headers: {
-            'Authorization': 'Bearer $authToken',
-            // Si tu servidor usa subprotocolo para auth:
-            // 'Sec-WebSocket-Protocol': 'bearer, $authToken',
-          },
-        );
-      }
-
+      _channel = _createChannel();
       _listen();
     } catch (e) {
       onError?.call(e);
@@ -84,49 +57,76 @@ class SocketService {
     }
   }
 
+  WebSocketChannel _createChannel() {
+    if (kIsWeb) {
+      return WebSocketChannel.connect(_uriForWeb());
+    } else {
+      final client = _createHttpClient();
+      return IOWebSocketChannel.connect(
+        Uri.parse(wsBase),
+        headers: {'Authorization': 'Bearer $authToken'},
+        customClient: client,
+        pingInterval: const Duration(seconds: 20),
+      );
+    }
+  }
+
+  HttpClient _createHttpClient() {
+    final client = HttpClient();
+    client.badCertificateCallback = (cert, host, port) {
+      if (!kDebugMode) return false;
+      final hp = '$host:$port';
+      return hp == '10.0.2.2:5223' || hp == 'localhost:5223' || hp == '127.0.0.1:5223';
+    };
+    return client;
+  }
+
+  bool _isConnectingOrOpen() =>
+      status == SocketStatus.connecting || status == SocketStatus.open;
+
   void _listen() {
     _channel?.stream.listen(
-          (raw) {
-        try {
-          final data = raw is String ? jsonDecode(raw) : raw;
-          if (data is Map<String, dynamic> && data.containsKey('type')) {
-            final env = WsEnvelope.fromJson(data);
-            switch (env.type) {
-              case 'message':
-                onMessage(ChatMessage.fromJson(env.payload));
-                break;
-              case 'ack':
-                final id = (env.payload['messageId'] ?? '').toString();
-                if (id.isNotEmpty) onAck?.call(id);
-                break;
-              case 'error':
-                onError?.call(env.payload);
-                break;
-              case 'pong':
-              // opcional: manejar pongs
-                break;
-              default:
-              // ignora otros tipos
-                break;
-            }
-          }
-        } catch (e) {
-          onError?.call('WS parse error: $e');
-        }
-      },
+      _handleRawMessage,
       onDone: _onCloseAndMaybeReconnect,
-      onError: (err) {
-        onError?.call(err);
-        // el stream se cerrará por cancelOnError=true
-      },
+      onError: onError,
       cancelOnError: true,
     );
-
-    // Consideramos "open" al quedar suscrito sin error
     status = SocketStatus.open;
     _backoff = const Duration(seconds: 2);
     _startHeartbeat();
     _sendRegister();
+  }
+
+  void _handleRawMessage(dynamic raw) {
+    try {
+      final data = raw is String ? jsonDecode(raw) : raw;
+      if (data is Map<String, dynamic> && data.containsKey('type')) {
+        _handleEnvelope(WsEnvelope.fromJson(data));
+      }
+    } catch (e) {
+      onError?.call('WS parse error: $e');
+    }
+  }
+
+  void _handleEnvelope(WsEnvelope env) {
+    switch (env.type) {
+      case 'message':
+        final payload = env.payload;
+        if (payload != null) onMessage(ChatMessage.fromJson(payload));
+        break;
+      case 'ack':
+        final payload = env.payload;
+        final id = (payload != null ? payload['messageId'] : '')?.toString() ?? '';
+        if (id.isNotEmpty) onAck?.call(id);
+        break;
+      case 'error':
+        onError?.call(env.payload);
+        break;
+      case 'pong':
+        break;
+      default:
+        break;
+    }
   }
 
   void _startHeartbeat() {
@@ -137,9 +137,7 @@ class SocketService {
   }
 
   void _sendRegister() {
-    _send(WsEnvelope(type: 'register', payload: {
-      'userId': userId,
-    }));
+    _send(WsEnvelope(type: 'register', payload: {'userId': userId}));
   }
 
   void sendMessage(ChatMessage msg) {
@@ -177,29 +175,11 @@ class SocketService {
     });
   }
 
-  /// DEV ONLY: permite cert self-signed para hosts locales (evita SslCloseCompletionEvent).
-  void _installDevHttpOverrides() {
-    // Ajusta los hosts/puertos de desarrollo que usas:
-    final allowed = <String>{
-      '10.0.2.2:5223',
-      '127.0.0.1:5223',
-      'localhost:5223',
-    };
-    HttpOverrides.global = _DevHttpOverrides(allowedHosts: allowed);
-  }
-}
-
-class _DevHttpOverrides extends HttpOverrides {
-  _DevHttpOverrides({required this.allowedHosts});
-  final Set<String> allowedHosts;
-
-  @override
-  HttpClient createHttpClient(SecurityContext? context) {
-    final client = super.createHttpClient(context);
-    client.badCertificateCallback = (X509Certificate cert, String host, int port) {
-      // SOLO DEV: aceptar certs self-signed para estos hosts:puerto
-      return allowedHosts.contains('$host:$port');
-    };
-    return client;
+  Uri _uriForWeb() {
+    final uri = Uri.parse(wsBase);
+    return uri.replace(queryParameters: {
+      ...uri.queryParameters,
+      'auth': authToken,
+    });
   }
 }

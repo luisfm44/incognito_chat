@@ -1,13 +1,28 @@
-class ChatMessage {
+import 'package:equatable/equatable.dart';
+import 'package:meta/meta.dart';
+
+/// Representa un mensaje de chat entre usuarios.
+@immutable
+class ChatMessage extends Equatable {
+  /// Identificador único del mensaje.
   final String messageId;
+
+  /// ID de la conversación a la que pertenece el mensaje.
   final String conversationId;
+
+  /// ID del usuario que envía el mensaje.
   final String fromUserId;
+
+  /// Contenido textual del mensaje.
   final String content;
+
+  /// Marca de tiempo generada por el cliente.
   final DateTime timestampClient;
+
+  /// Marca de tiempo generada por el servidor (opcional).
   final DateTime? timestampServer;
 
-
-  ChatMessage({
+  const ChatMessage({
     required this.messageId,
     required this.conversationId,
     required this.fromUserId,
@@ -16,7 +31,7 @@ class ChatMessage {
     this.timestampServer,
   });
 
-
+  /// Crea una instancia desde un mapa JSON.
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
     return ChatMessage(
       messageId: json['messageId'] as String,
@@ -30,7 +45,7 @@ class ChatMessage {
     );
   }
 
-
+  /// Convierte la instancia a un mapa JSON.
   Map<String, dynamic> toJson() => {
     'messageId': messageId,
     'conversationId': conversationId,
@@ -40,4 +55,14 @@ class ChatMessage {
     if (timestampServer != null)
       'timestampServer': timestampServer!.toIso8601String(),
   };
+
+  @override
+  List<Object?> get props => [
+    messageId,
+    conversationId,
+    fromUserId,
+    content,
+    timestampClient,
+    timestampServer,
+  ];
 }

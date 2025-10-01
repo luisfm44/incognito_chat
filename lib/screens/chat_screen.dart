@@ -1,11 +1,13 @@
-import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:share_plus/share_plus.dart';
+
 import '../models/chat_message.dart';
 import '../services/api_client.dart';
 import '../services/auth_service.dart';
 import '../services/socket_service.dart';
+import '../services/deep_link_service.dart';
+import '../config.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key});
@@ -17,6 +19,7 @@ class ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<ChatScreen> {
   final _messageController = TextEditingController();
   final _inviteTokenController = TextEditingController();
+  final DeepLinkService _links = DeepLinkService();
 
   late final ApiClient api;
   AuthService? auth;
@@ -30,20 +33,41 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
-    // Ajusta el host según tu server (10.0.2.2 para emulador Android)
-    final base = Platform.isAndroid ? 'https://10.0.2.2:5223' : 'https://localhost:5223';
-    api = ApiClient(base);
+    // REST va al puerto HTTP (AppConfig.restBase)
+    api = ApiClient(AppConfig.restBase);
     auth = AuthService(api);
     _bootstrap();
+
+    // Deep links: incognitochat://invite?token=XYZ
+    _links.init((uri) {
+      final token = uri.queryParameters['token'];
+      if (token != null && token.isNotEmpty) {
+        _inviteTokenController.text = token;
+        _acceptInvite();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _links.dispose();
+    socket?.dispose();
+    _messageController.dispose();
+    _inviteTokenController.dispose();
+    super.dispose();
   }
 
   Future<void> _bootstrap() async {
     try {
       final (uid, token) = await auth!.ensureIdentityAndToken();
+      // 👉 Asigna el token al ApiClient para que envíe Authorization: Bearer ...
+      api.authToken = token;
+
       setState(() {
         userId = uid;
         authToken = token;
       });
+
       _openSocket();
     } catch (e) {
       _snack('Error de registro: $e');
@@ -51,29 +75,17 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _openSocket() {
-    final wsUrl = '${api.baseUrl.replaceFirst(RegExp(r'^https://'), 'wss://')}/chat';
-
+    if (userId == null || authToken == null) return;
+    final wsUrl = AppConfig.wsUrl; // WSS en 5223
     socket = SocketService(
       userId: userId!,
       wsBase: wsUrl,
       authToken: authToken!,
-      onMessage: (msg) {
-        setState(() => messages.add(msg));
-      },
-      onAck: (id) {
-        // opcional: marcar entregado
-      },
+      onMessage: (msg) => setState(() => messages.add(msg)),
+      onAck: (_) {},
       onError: (err) => _snack('WS error: $err'),
       onClosed: () => _snack('Conexión cerrada, reintentando…'),
     )..connect();
-  }
-
-  @override
-  void dispose() {
-    socket?.dispose();
-    _messageController.dispose();
-    _inviteTokenController.dispose();
-    super.dispose();
   }
 
   void _snack(String msg) {
@@ -83,6 +95,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _createConversation() async {
     try {
+      if (api.authToken == null) {
+        _snack('Registrando dispositivo… intenta de nuevo en un momento');
+        return;
+      }
       final (cid, invite) = await api.createConversation();
       setState(() => conversationId = cid);
       final deepLink = 'incognitochat://invite?token=$invite';
@@ -129,7 +145,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _sendMessage() {
     final text = _messageController.text.trim();
-    if (text.isEmpty || conversationId == null) return;
+    if (text.isEmpty || conversationId == null || userId == null) return;
     final msg = ChatMessage(
       messageId: DateTime.now().microsecondsSinceEpoch.toString(),
       conversationId: conversationId!,
@@ -146,13 +162,15 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final canCreate = authToken != null; // deshabilitar "+" hasta tener token
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Incognito Chat (v2)'),
         actions: [
           IconButton(
-            tooltip: 'Nueva conversación',
-            onPressed: _createConversation,
+            tooltip: canCreate ? 'Nueva conversación' : 'Registrando…',
+            onPressed: canCreate ? _createConversation : null,
             icon: const Icon(Icons.add_comment_rounded),
           ),
         ],
@@ -225,7 +243,8 @@ class _ChatScreenState extends State<ChatScreen> {
                         Text(m.content),
                         const SizedBox(height: 4),
                         Text(
-                          m.timestampServer?.toLocal().toString() ?? m.timestampClient.toLocal().toString(),
+                          m.timestampServer?.toLocal().toString() ??
+                              m.timestampClient.toLocal().toString(),
                           style: const TextStyle(fontSize: 10, color: Colors.black54),
                         ),
                       ],
